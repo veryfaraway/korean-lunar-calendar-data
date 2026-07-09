@@ -1,0 +1,191 @@
+# 한국천문연구원 음양력 데이터 다운로드 (GitHub Actions)
+#
+# 사용법:
+#   1. GitHub 리포지토리 Settings > Secrets and variables > Actions에서
+#      SERVICE_KEY 시크릿에 공공데이터포털 서비스키를 등록
+#   2. Actions 탭에서 "음양력 데이터 다운로드" 워크플로우를 수동 실행
+#   3. 완료 후 Artifacts에서 결과 파일을 다운로드
+#
+# 참고:
+#   - GitHub Actions 무료 플랜: 한 Job 최대 6시간
+#   - 1826~2050 (82,000건, ~70분) → 충분히 1회 실행으로 완료 가능
+#   - 기간을 나눠서 병렬 실행하면 더 빠름 (matrix 활용)
+
+name: 음양력 데이터 다운로드
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_year:
+        description: '시작 연도'
+        required: true
+        default: '1826'
+        type: string
+      end_year:
+        description: '종료 연도'
+        required: true
+        default: '2050'
+        type: string
+      parallel:
+        description: '병렬 실행 (연도 범위를 나누어 동시 다운로드)'
+        required: true
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+jobs:
+  # ─────────────────────────────────────────
+  # 옵션 1: 병렬 실행 (빠름, ~15분)
+  # ─────────────────────────────────────────
+  compute-matrix:
+    if: ${{ inputs.parallel == 'true' }}
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.split.outputs.matrix }}
+    steps:
+      - name: 연도 범위 분할
+        id: split
+        run: |
+          python3 -c "
+          import json, math
+          start = int('${{ inputs.start_year }}')
+          end = int('${{ inputs.end_year }}')
+          total = end - start + 1
+          # 약 45년 단위로 분할 (5개 병렬 잡)
+          chunk = max(math.ceil(total / 5), 1)
+          ranges = []
+          s = start
+          while s <= end:
+              e = min(s + chunk - 1, end)
+              ranges.append({'start': s, 'end': e, 'label': f'{s}_{e}'})
+              s = e + 1
+          print(f'matrix={json.dumps({\"include\": ranges})}')
+          " >> "$GITHUB_OUTPUT"
+
+  download-parallel:
+    if: ${{ inputs.parallel == 'true' }}
+    needs: compute-matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      matrix: ${{ fromJson(needs.compute-matrix.outputs.matrix) }}
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Python 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 의존성 설치
+        run: pip install requests
+
+      - name: 데이터 다운로드 (${{ matrix.start }}~${{ matrix.end }})
+        env:
+          SERVICE_KEY: ${{ secrets.SERVICE_KEY }}
+        run: |
+          python download_lunar_solar.py \
+            --start ${{ matrix.start }} \
+            --end ${{ matrix.end }} \
+            --output data/
+
+      - name: 결과 업로드
+        uses: actions/upload-artifact@v4
+        with:
+          name: lunar-solar-${{ matrix.label }}
+          path: data/
+          retention-days: 90
+
+  # 병렬 결과 병합
+  merge-results:
+    if: ${{ inputs.parallel == 'true' }}
+    needs: download-parallel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 모든 파트 다운로드
+        uses: actions/download-artifact@v4
+        with:
+          pattern: lunar-solar-*
+          path: parts/
+          merge-multiple: false
+
+      - name: JSON/CSV 병합
+        run: |
+          python3 -c "
+          import json, csv, glob, os
+
+          # 모든 JSON 파일 수집 & 정렬
+          all_records = []
+          for jf in sorted(glob.glob('parts/*/lunar_solar_*.json')):
+              print(f'Loading: {jf}')
+              with open(jf, encoding='utf-8') as f:
+                  data = json.load(f)
+                  all_records.extend(data)
+                  print(f'  -> {len(data):,} records')
+
+          print(f'\nTotal: {len(all_records):,} records')
+
+          os.makedirs('merged', exist_ok=True)
+          start = '${{ inputs.start_year }}'
+          end = '${{ inputs.end_year }}'
+
+          # 병합 JSON
+          with open(f'merged/lunar_solar_{start}_{end}.json', 'w', encoding='utf-8') as f:
+              json.dump(all_records, f, ensure_ascii=False, indent=2)
+
+          # 병합 CSV
+          if all_records:
+              keys = list(all_records[0].keys())
+              with open(f'merged/lunar_solar_{start}_{end}.csv', 'w', newline='', encoding='utf-8-sig') as f:
+                  writer = csv.DictWriter(f, fieldnames=keys)
+                  writer.writeheader()
+                  writer.writerows(all_records)
+
+          print('Merge complete!')
+          "
+
+      - name: 병합 결과 업로드
+        uses: actions/upload-artifact@v4
+        with:
+          name: lunar-solar-merged-${{ inputs.start_year }}-${{ inputs.end_year }}
+          path: merged/
+          retention-days: 90
+
+  # ─────────────────────────────────────────
+  # 옵션 2: 단일 실행 (간단, ~70분)
+  # ─────────────────────────────────────────
+  download-single:
+    if: ${{ inputs.parallel == 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Python 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 의존성 설치
+        run: pip install requests
+
+      - name: 데이터 다운로드
+        env:
+          SERVICE_KEY: ${{ secrets.SERVICE_KEY }}
+        run: |
+          python download_lunar_solar.py \
+            --start ${{ inputs.start_year }} \
+            --end ${{ inputs.end_year }} \
+            --output data/
+
+      - name: 결과 업로드
+        uses: actions/upload-artifact@v4
+        with:
+          name: lunar-solar-${{ inputs.start_year }}-${{ inputs.end_year }}
+          path: data/
+          retention-days: 90
