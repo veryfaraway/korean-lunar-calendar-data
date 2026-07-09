@@ -2,6 +2,9 @@
 
 > 한국천문연구원 공식 API 기반 음양력 변환 데이터 일괄 다운로더
 
+[![GitHub Sponsors](https://img.shields.io/badge/Sponsor-GitHub-ea4aaa?style=flat-square&logo=github-sponsors)](https://github.com/sponsors/veryfaraway)
+[![Ko-fi](https://img.shields.io/badge/Support-Ko--fi-ff5e5b?style=flat-square&logo=kofi&logoColor=white)](https://ko-fi.com/eoneone)
+
 공공데이터포털의 [한국천문연구원 음양력 정보제공 서비스](https://www.data.go.kr/data/15012679/openapi.do) API를 사용하여
 **1826년~2050년** (225년간, 약 82,000일) 의 양력↔음력 변환 데이터를 일괄 다운로드합니다.
 
@@ -212,6 +215,19 @@ data/
 - **오퍼레이션**: `getLunCalInfo` (양력 → 음력 변환)
 - **Base URL**: `http://apis.data.go.kr/B090041/openapi/service/LrsrCldInfoService`
 - **제공 기관**: 한국천문연구원 (KASI)
+
+---
+
+## 💖 후원 (Support)
+
+이 프로젝트가 도움이 되셨다면 후원을 통해 개발자를 응원해주세요!
+
+<a href="https://github.com/sponsors/YOUR_GITHUB_USERNAME">
+  <img src="https://img.shields.io/badge/Sponsor-GitHub_Sponsors-ea4aaa?style=for-the-badge&logo=github-sponsors&logoColor=white" alt="GitHub Sponsors" />
+</a>
+<a href="https://ko-fi.com/YOUR_KOFI_USERNAME">
+  <img src="https://storage.ko-fi.com/cdn/brandasset/kofi_button_blue.png" alt="Buy Me a Coffee at ko-fi.com" height="36" />
+</a>
 
 ---
 
