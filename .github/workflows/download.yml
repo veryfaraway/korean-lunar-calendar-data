@@ -1,19 +1,19 @@
 # 한국천문연구원 음양력 데이터 다운로드 (GitHub Actions)
 #
-# 사용법:
-#   1. GitHub 리포지토리 Settings > Secrets and variables > Actions에서
-#      SERVICE_KEY 시크릿에 공공데이터포털 서비스키를 등록
-#   2. Actions 탭에서 "음양력 데이터 다운로드" 워크플로우를 수동 실행
-#   3. 완료 후 Artifacts에서 결과 파일을 다운로드
+# 일일 API 한도를 인식하여 자동으로 최적의 전략을 선택합니다:
+#   - 총 건수 ≤ 일일 한도 → 병렬 분할 다운로드 (빠름)
+#   - 총 건수 > 일일 한도 → 단일 잡 + 한도까지만 수집 후 종료
 #
-# 참고:
-#   - GitHub Actions 무료 플랜: 한 Job 최대 6시간
-#   - 1826~2050 (82,000건, ~70분) → 충분히 1회 실행으로 완료 가능
-#   - 기간을 나눠서 병렬 실행하면 더 빠름 (matrix 활용)
+# 대량 다운로드 시 cron 스케줄로 매일 자동 실행하면
+# resume 기능 덕분에 며칠에 걸쳐 자동 완료됩니다.
+#
+# 📱 텔레그램 알림: 매 실행 결과를 자동 발송합니다.
+#   필요 Secrets: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
 name: 음양력 데이터 다운로드
 
 on:
+  # 수동 실행
   workflow_dispatch:
     inputs:
       start_year:
@@ -26,51 +26,87 @@ on:
         required: true
         default: '2050'
         type: string
-      parallel:
-        description: '병렬 실행 (연도 범위를 나누어 동시 다운로드)'
+      daily_limit:
+        description: '일일 API 호출 한도 (0=무제한)'
         required: true
-        default: 'true'
-        type: choice
-        options:
-          - 'true'
-          - 'false'
+        default: '10000'
+        type: string
+
+  # 매일 자동 실행 (대량 다운로드 시 활성화)
+  # 주석 해제하여 사용:
+  # schedule:
+  #   - cron: '0 15 * * *'  # 매일 KST 00:00 (UTC 15:00)
 
 jobs:
   # ─────────────────────────────────────────
-  # 옵션 1: 병렬 실행 (빠름, ~15분)
+  # 전략 결정: 병렬 vs 단일
   # ─────────────────────────────────────────
-  compute-matrix:
-    if: ${{ inputs.parallel == 'true' }}
+  plan:
     runs-on: ubuntu-latest
     outputs:
-      matrix: ${{ steps.split.outputs.matrix }}
+      strategy: ${{ steps.decide.outputs.strategy }}
+      matrix: ${{ steps.decide.outputs.matrix }}
+      start_year: ${{ steps.params.outputs.start_year }}
+      end_year: ${{ steps.params.outputs.end_year }}
+      daily_limit: ${{ steps.params.outputs.daily_limit }}
+      total_days: ${{ steps.decide.outputs.total_days }}
     steps:
-      - name: 연도 범위 분할
-        id: split
+      - name: 파라미터 설정
+        id: params
+        run: |
+          # workflow_dispatch이면 inputs 사용, schedule이면 기본값
+          echo "start_year=${{ inputs.start_year || '1826' }}" >> "$GITHUB_OUTPUT"
+          echo "end_year=${{ inputs.end_year || '2050' }}" >> "$GITHUB_OUTPUT"
+          echo "daily_limit=${{ inputs.daily_limit || '10000' }}" >> "$GITHUB_OUTPUT"
+
+      - name: 전략 결정
+        id: decide
         run: |
           python3 -c "
           import json, math
-          start = int('${{ inputs.start_year }}')
-          end = int('${{ inputs.end_year }}')
-          total = end - start + 1
-          # 약 45년 단위로 분할 (5개 병렬 잡)
-          chunk = max(math.ceil(total / 5), 1)
-          ranges = []
-          s = start
-          while s <= end:
-              e = min(s + chunk - 1, end)
-              ranges.append({'start': s, 'end': e, 'label': f'{s}_{e}'})
-              s = e + 1
-          print(f'matrix={json.dumps({\"include\": ranges})}')
-          " >> "$GITHUB_OUTPUT"
 
+          start = int('${{ steps.params.outputs.start_year }}')
+          end = int('${{ steps.params.outputs.end_year }}')
+          daily_limit = int('${{ steps.params.outputs.daily_limit }}')
+
+          # 총 일수 추정 (365.25일/년)
+          total_days = int((end - start + 1) * 365.25)
+
+          print(f'total_days={total_days}')
+
+          if daily_limit <= 0 or total_days <= daily_limit:
+              # 한도 내 → 병렬 분할
+              total_years = end - start + 1
+              num_chunks = min(5, total_years)
+              chunk = max(math.ceil(total_years / num_chunks), 1)
+              ranges = []
+              s = start
+              while s <= end:
+                  e = min(s + chunk - 1, end)
+                  ranges.append({'start': s, 'end': e, 'label': f'{s}_{e}'})
+                  s = e + 1
+
+              matrix = json.dumps({'include': ranges})
+              print(f'strategy=parallel')
+              print(f'matrix={matrix}')
+              print(f'  → 총 {total_days:,}일 ≤ 한도 {daily_limit:,} → 병렬 {len(ranges)}개 잡', flush=True)
+          else:
+              # 한도 초과 → 단일 잡 (한도까지만 수집)
+              print(f'strategy=single')
+              print(f'matrix={{}}')
+              print(f'  → 총 {total_days:,}일 > 한도 {daily_limit:,} → 단일 잡 (한도까지 수집)', flush=True)
+          " | tee /dev/stderr | grep -E '^(strategy|matrix|total_days)=' >> "$GITHUB_OUTPUT"
+
+  # ─────────────────────────────────────────
+  # 병렬 모드: 한도 내일 때
+  # ─────────────────────────────────────────
   download-parallel:
-    if: ${{ inputs.parallel == 'true' }}
-    needs: compute-matrix
+    if: needs.plan.outputs.strategy == 'parallel'
+    needs: plan
     runs-on: ubuntu-latest
     timeout-minutes: 120
     strategy:
-      matrix: ${{ fromJson(needs.compute-matrix.outputs.matrix) }}
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
       fail-fast: false
     steps:
       - uses: actions/checkout@v4
@@ -93,16 +129,17 @@ jobs:
             --output data/
 
       - name: 결과 업로드
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: lunar-solar-${{ matrix.label }}
           path: data/
           retention-days: 90
 
-  # 병렬 결과 병합
+  # 병렬 결과 병합 + 알림
   merge-results:
-    if: ${{ inputs.parallel == 'true' }}
-    needs: download-parallel
+    if: needs.plan.outputs.strategy == 'parallel' && always()
+    needs: [plan, download-parallel]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -115,12 +152,13 @@ jobs:
           merge-multiple: false
 
       - name: JSON/CSV 병합
+        id: merge
         run: |
           python3 -c "
           import json, csv, glob, os
 
-          # 모든 JSON 파일 수집 & 정렬
           all_records = []
+          failed_count = 0
           for jf in sorted(glob.glob('parts/*/lunar_solar_*.json')):
               print(f'Loading: {jf}')
               with open(jf, encoding='utf-8') as f:
@@ -128,17 +166,20 @@ jobs:
                   all_records.extend(data)
                   print(f'  -> {len(data):,} records')
 
-          print(f'\nTotal: {len(all_records):,} records')
+          # 실패 건수 집계
+          for ff in sorted(glob.glob('parts/*/failed_*.json')):
+              with open(ff, encoding='utf-8') as f:
+                  failed_count += len(json.load(f))
+
+          print(f'\nTotal: {len(all_records):,} records, Failed: {failed_count}')
 
           os.makedirs('merged', exist_ok=True)
-          start = '${{ inputs.start_year }}'
-          end = '${{ inputs.end_year }}'
+          start = '${{ needs.plan.outputs.start_year }}'
+          end = '${{ needs.plan.outputs.end_year }}'
 
-          # 병합 JSON
           with open(f'merged/lunar_solar_{start}_{end}.json', 'w', encoding='utf-8') as f:
               json.dump(all_records, f, ensure_ascii=False, indent=2)
 
-          # 병합 CSV
           if all_records:
               keys = list(all_records[0].keys())
               with open(f'merged/lunar_solar_{start}_{end}.csv', 'w', newline='', encoding='utf-8-sig') as f:
@@ -146,23 +187,85 @@ jobs:
                   writer.writeheader()
                   writer.writerows(all_records)
 
+          # 결과를 output으로 전달
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f'record_count={len(all_records)}\n')
+              f.write(f'failed_count={failed_count}\n')
+
           print('Merge complete!')
           "
 
       - name: 병합 결과 업로드
         uses: actions/upload-artifact@v4
         with:
-          name: lunar-solar-merged-${{ inputs.start_year }}-${{ inputs.end_year }}
+          name: lunar-solar-merged-${{ needs.plan.outputs.start_year }}-${{ needs.plan.outputs.end_year }}
           path: merged/
           retention-days: 90
 
+      - name: 📱 텔레그램 알림 (병렬 완료)
+        if: always()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          # 텔레그램 설정이 없으면 스킵
+          if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+            echo "⏭ 텔레그램 설정이 없어 알림을 건너뜁니다."
+            exit 0
+          fi
+
+          RECORD_COUNT="${{ steps.merge.outputs.record_count || '0' }}"
+          FAILED_COUNT="${{ steps.merge.outputs.failed_count || '0' }}"
+          TOTAL_DAYS="${{ needs.plan.outputs.total_days }}"
+          JOB_STATUS="${{ needs.download-parallel.result }}"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          if [ "$JOB_STATUS" = "success" ] && [ "$FAILED_COUNT" = "0" ]; then
+            STATUS_EMOJI="🎉"
+            STATUS_TEXT="완료"
+            EXTRA_MSG="
+          ✅ *전체 다운로드 완료\\!*
+          Artifacts에서 최종 파일을 다운로드하세요\\."
+          else
+            STATUS_EMOJI="⚠️"
+            STATUS_TEXT="부분 완료"
+            EXTRA_MSG="
+          ⚠️ 실패 ${FAILED_COUNT}건이 있습니다\\.
+          워크플로우 로그를 확인하세요\\."
+          fi
+
+          # 진행률 계산
+          if [ "$TOTAL_DAYS" -gt 0 ] 2>/dev/null; then
+            PROGRESS=$(python3 -c "print(f'{int(${RECORD_COUNT}) / int(${TOTAL_DAYS}) * 100:.1f}')")
+          else
+            PROGRESS="?"
+          fi
+
+          MSG="${STATUS_EMOJI} *음양력 데이터 다운로드 \\- ${STATUS_TEXT}*
+
+          📅 기간: ${{ needs.plan.outputs.start_year }}년 \\~ ${{ needs.plan.outputs.end_year }}년
+          📊 모드: 병렬 다운로드
+          ✅ 수집: ${RECORD_COUNT}건 / ${TOTAL_DAYS}일 \\(${PROGRESS}%\\)
+          ❌ 실패: ${FAILED_COUNT}건
+          ${EXTRA_MSG}
+
+          🔗 [워크플로우 로그](${RUN_URL})"
+
+          curl -s -X POST \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d "chat_id=${TELEGRAM_CHAT_ID}" \
+            -d "parse_mode=MarkdownV2" \
+            -d "text=${MSG}" \
+            -d "disable_web_page_preview=true"
+
   # ─────────────────────────────────────────
-  # 옵션 2: 단일 실행 (간단, ~70분)
+  # 단일 모드: 한도 초과 시 (한도까지만 수집)
   # ─────────────────────────────────────────
   download-single:
-    if: ${{ inputs.parallel == 'false' }}
+    if: needs.plan.outputs.strategy == 'single'
+    needs: plan
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
 
@@ -174,18 +277,137 @@ jobs:
       - name: 의존성 설치
         run: pip install requests
 
-      - name: 데이터 다운로드
+      - name: 이전 진행 상태 복원
+        uses: actions/download-artifact@v4
+        with:
+          name: lunar-solar-progress-${{ needs.plan.outputs.start_year }}-${{ needs.plan.outputs.end_year }}
+          path: data/
+        continue-on-error: true  # 첫 실행 시 artifact 없음
+
+      - name: 데이터 다운로드 (한도까지)
+        id: download
         env:
           SERVICE_KEY: ${{ secrets.SERVICE_KEY }}
         run: |
           python download_lunar_solar.py \
-            --start ${{ inputs.start_year }} \
-            --end ${{ inputs.end_year }} \
+            --start ${{ needs.plan.outputs.start_year }} \
+            --end ${{ needs.plan.outputs.end_year }} \
+            --daily-limit ${{ needs.plan.outputs.daily_limit }} \
             --output data/
 
-      - name: 결과 업로드
+      - name: 진행 상태 분석
+        id: status
+        if: always()
+        run: |
+          START="${{ needs.plan.outputs.start_year }}"
+          END="${{ needs.plan.outputs.end_year }}"
+          PROGRESS_FILE="data/.progress_${START}_${END}.json"
+          JSON_FILE="data/lunar_solar_${START}_${END}.json"
+          FAILED_FILE="data/failed_${START}_${END}.json"
+
+          # 현재 수집 건수
+          if [ -f "$JSON_FILE" ]; then
+            RECORD_COUNT=$(python3 -c "import json; print(len(json.load(open('${JSON_FILE}'))))")
+          else
+            RECORD_COUNT=0
+          fi
+
+          # 실패 건수
+          if [ -f "$FAILED_FILE" ]; then
+            FAILED_COUNT=$(python3 -c "import json; print(len(json.load(open('${FAILED_FILE}'))))")
+          else
+            FAILED_COUNT=0
+          fi
+
+          # 완료 여부
+          if [ -f "$PROGRESS_FILE" ]; then
+            IS_COMPLETE="false"
+            LAST_DATE=$(python3 -c "import json; print(json.load(open('${PROGRESS_FILE}'))['last_date'])")
+          else
+            IS_COMPLETE="true"
+            LAST_DATE="${END}-12-31"
+          fi
+
+          echo "record_count=${RECORD_COUNT}" >> "$GITHUB_OUTPUT"
+          echo "failed_count=${FAILED_COUNT}" >> "$GITHUB_OUTPUT"
+          echo "is_complete=${IS_COMPLETE}" >> "$GITHUB_OUTPUT"
+          echo "last_date=${LAST_DATE}" >> "$GITHUB_OUTPUT"
+
+          echo "📊 수집: ${RECORD_COUNT}건, 실패: ${FAILED_COUNT}건, 완료: ${IS_COMPLETE}, 마지막: ${LAST_DATE}"
+
+      - name: 진행 상태 업로드 (이어서 받기용)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: lunar-solar-${{ inputs.start_year }}-${{ inputs.end_year }}
+          name: lunar-solar-progress-${{ needs.plan.outputs.start_year }}-${{ needs.plan.outputs.end_year }}
           path: data/
           retention-days: 90
+          overwrite: true
+
+      - name: 📱 텔레그램 알림 (단일 모드)
+        if: always()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          # 텔레그램 설정이 없으면 스킵
+          if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+            echo "⏭ 텔레그램 설정이 없어 알림을 건너뜁니다."
+            exit 0
+          fi
+
+          RECORD_COUNT="${{ steps.status.outputs.record_count }}"
+          FAILED_COUNT="${{ steps.status.outputs.failed_count }}"
+          IS_COMPLETE="${{ steps.status.outputs.is_complete }}"
+          LAST_DATE="${{ steps.status.outputs.last_date }}"
+          TOTAL_DAYS="${{ needs.plan.outputs.total_days }}"
+          DAILY_LIMIT="${{ needs.plan.outputs.daily_limit }}"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          # 진행률 계산
+          if [ "$TOTAL_DAYS" -gt 0 ] 2>/dev/null; then
+            PROGRESS=$(python3 -c "print(f'{int(${RECORD_COUNT}) / int(${TOTAL_DAYS}) * 100:.1f}')")
+          else
+            PROGRESS="?"
+          fi
+
+          if [ "$IS_COMPLETE" = "true" ]; then
+            MSG="🎉 *음양력 데이터 다운로드 \\- 전체 완료\\!*
+
+          📅 기간: ${{ needs.plan.outputs.start_year }}년 \\~ ${{ needs.plan.outputs.end_year }}년
+          ✅ 총 수집: ${RECORD_COUNT}건
+          ❌ 실패: ${FAILED_COUNT}건
+
+          🏁 *모든 데이터 수집이 완료되었습니다\\!*
+          Artifacts에서 최종 파일을 다운로드하세요\\.
+
+          ⚙️ \`schedule\\(cron\\)\` 을 활성화해두셨다면,
+          이제 비활성화\\(주석 처리\\)하셔도 됩니다\\.
+
+          🔗 [워크플로우 로그](${RUN_URL})"
+
+          else
+            # 남은 일수 추정
+            REMAINING=$(python3 -c "print(max(0, int(${TOTAL_DAYS}) - int(${RECORD_COUNT})))")
+            DAYS_LEFT=$(python3 -c "import math; print(math.ceil(int(${REMAINING}) / int(${DAILY_LIMIT})))")
+
+            MSG="📊 *음양력 데이터 다운로드 \\- 오늘 분 완료*
+
+          📅 기간: ${{ needs.plan.outputs.start_year }}년 \\~ ${{ needs.plan.outputs.end_year }}년
+          📆 오늘 한도: ${DAILY_LIMIT}건
+          📈 누적 수집: ${RECORD_COUNT}건 / ${TOTAL_DAYS}일 \\(${PROGRESS}%\\)
+          ❌ 실패: ${FAILED_COUNT}건
+          📍 마지막 날짜: ${LAST_DATE}
+
+          ⏳ 남은 예상: *약 ${DAYS_LEFT}일* 후 완료
+          ▓▓▓▓▓▓▓▓░░ ${PROGRESS}%
+
+          🔗 [워크플로우 로그](${RUN_URL})"
+          fi
+
+          curl -s -X POST \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d "chat_id=${TELEGRAM_CHAT_ID}" \
+            -d "parse_mode=MarkdownV2" \
+            -d "text=${MSG}" \
+            -d "disable_web_page_preview=true"

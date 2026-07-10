@@ -107,14 +107,17 @@ python download_lunar_solar.py --output ./my_data
 ## ☁️ GitHub Actions로 실행 (권장)
 
 로컬 PC를 오래 묶어두기 싫다면 **GitHub Actions**에서 실행할 수 있습니다.
+일일 API 호출 한도를 자동 인식하여 **병렬/단일 전략을 지능적으로 선택**합니다.
 
 ### 설정
 
-1. **서비스키 등록**: 리포지토리 `Settings` → `Secrets and variables` → `Actions` → `New repository secret`
+1. **Secrets 등록**: 리포지토리 `Settings` → `Secrets and variables` → `Actions` → `New repository secret`
 
-   | Name | Value |
-   |------|-------|
-   | `SERVICE_KEY` | 공공데이터포털에서 발급받은 서비스키 |
+   | Name | Value | 필수 |
+   |------|-------|------|
+   | `SERVICE_KEY` | 공공데이터포털에서 발급받은 서비스키 | ✅ |
+   | `TELEGRAM_BOT_TOKEN` | 텔레그램 봇 토큰 ([BotFather](https://t.me/BotFather)에서 발급) | 선택 |
+   | `TELEGRAM_CHAT_ID` | 알림 받을 채팅 ID ([userinfobot](https://t.me/userinfobot)으로 확인) | 선택 |
 
 2. **워크플로우 실행**: `Actions` 탭 → `음양력 데이터 다운로드` → `Run workflow`
 
@@ -122,16 +125,40 @@ python download_lunar_solar.py --output ./my_data
    |------|--------|------|
    | `start_year` | `1826` | 시작 연도 |
    | `end_year` | `2050` | 종료 연도 |
-   | `parallel` | `true` | 병렬 실행 여부 |
+   | `daily_limit` | `10000` | 일일 API 호출 한도 (0=무제한) |
 
 3. **결과 다운로드**: 워크플로우 완료 후 하단 `Artifacts` 섹션에서 ZIP 다운로드 (90일 보관)
 
-### 실행 모드 비교
+### 지능형 실행 모드
 
-| 모드 | 실제 소요 시간 | Actions 사용량 | 장점 |
-|------|-------------|---------------|------|
-| **병렬** (`true`) | **~15분** | ~70분 | 빠름 (5개 잡 동시 실행 → 자동 병합) |
-| 단일 (`false`) | ~68분 | ~68분 | 간단, 디버깅 용이 |
+워크플로우는 **총 일수 vs 일일 한도**를 비교하여 자동으로 최적 전략을 선택합니다:
+
+| 조건 | 모드 | 동작 |
+|------|------|------|
+| 총 일수 ≤ 일일 한도 | 🚀 **병렬** | 5분할 동시 다운로드 → 자동 병합 |
+| 총 일수 > 일일 한도 | 📊 **단일 이어받기** | 한도까지 수집 → 저장 → 다음 실행 시 이어서 |
+
+> 💡 1826~2050년(82,000일)을 일일 한도 10,000건으로 받으면, **약 9일**에 걸쳐 자동 완료됩니다.
+
+### 📱 텔레그램 알림
+
+텔레그램 Secrets를 등록해두면 매 실행마다 자동으로 알림을 보내줍니다:
+
+- **매일 실행 후**: 오늘 수집 건수, 누적 진행률(%), 남은 예상 일수
+- **전체 완료 시**: 🎉 완료 알림 + cron 스케줄 비활성화 안내
+
+> 텔레그램 Secrets 미등록 시 알림 없이 정상 동작합니다.
+
+### ⏰ 대량 다운로드 자동화 (cron)
+
+매일 수동으로 "Run workflow"를 누르기 싫다면, `.github/workflows/download.yml`의 `schedule` 주석을 해제하세요:
+
+```yaml
+schedule:
+  - cron: '0 15 * * *'  # 매일 KST 00:00 (UTC 15:00)
+```
+
+활성화하면 매일 자정에 자동 실행 → 한도까지 수집 → 텔레그램 알림 → 며칠 후 완료 시 비활성화 안내까지 받을 수 있습니다.
 
 > 💡 **무료 플랜 (2,000분/월)** 으로 충분히 실행 가능합니다.
 

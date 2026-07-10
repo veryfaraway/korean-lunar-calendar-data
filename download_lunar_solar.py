@@ -66,6 +66,12 @@ DELAY = 1.0 / CALLS_PER_SECOND
 MAX_RETRIES = 5
 RETRY_BACKOFF = 2.0  # 지수 백오프 기본 초
 
+# 연속 실패 시 조기 중단 임계값
+CONSECUTIVE_FAIL_LIMIT = 20
+
+# 기본 일일 API 호출 한도 (공공데이터포털 기본값)
+DEFAULT_DAILY_LIMIT = 0  # 0 = 무제한
+
 # 스피너 문자 (Braille 패턴)
 SPINNER_CHARS = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
@@ -328,6 +334,7 @@ def download_range(
     service_key: str,
     output_dir: Path,
     resume: bool = True,
+    daily_limit: int = 0,
 ):
     """
     start_year~end_year 기간의 모든 양력일에 대해
@@ -364,13 +371,20 @@ def download_range(
     total = total_days(start_date, end_date)
     remaining = total_days(actual_start, end_date)
 
+    # 이번 실행에서 처리할 건수 결정
+    effective_remaining = remaining
+    if daily_limit > 0:
+        effective_remaining = min(remaining, daily_limit)
+
     print(f"\n{'='*60}")
     print(f"📅 한국천문연구원 음양력 데이터 다운로드")
     print(f"   기간: {start_year}년 ~ {end_year}년")
     print(f"   총 일수: {total:,}일")
     if mode == "a":
         print(f"   남은 일수: {remaining:,}일 (이미 {existing_count:,}건 완료)")
-    print(f"   예상 소요 시간: ~{remaining / CALLS_PER_SECOND / 60:.0f}분")
+    if daily_limit > 0:
+        print(f"   일일 한도: {daily_limit:,}건 (이번 실행: 최대 {effective_remaining:,}건)")
+    print(f"   예상 소요 시간: ~{effective_remaining / CALLS_PER_SECOND / 60:.0f}분")
     print(f"   출력: {json_path}")
     print(f"         {csv_path}")
     print(f"{'='*60}\n")
@@ -387,7 +401,10 @@ def download_range(
     session.headers.update({"Accept": "application/xml"})
 
     count = existing_count
+    api_calls = 0  # 이번 실행에서의 API 호출 수
     failed = []
+    consecutive_fails = 0
+    quota_reached = False
 
     # Ctrl+C 시 진행 상태 저장
     interrupted = False
@@ -411,23 +428,44 @@ def download_range(
             if interrupted:
                 break
 
+            # 일일 한도 체크
+            if daily_limit > 0 and api_calls >= daily_limit:
+                quota_reached = True
+                print(f"\n\n📊 일일 한도 도달 ({daily_limit:,}건). 진행 상태를 저장하고 종료합니다.")
+                break
+
             record = fetch_day(session, service_key, d)
+            api_calls += 1
 
             if record:
                 records.append(record)
                 count += 1
+                consecutive_fails = 0  # 성공 시 리셋
             else:
                 failed.append(d.isoformat())
+                consecutive_fails += 1
+
+                # 연속 실패 시 조기 중단
+                if consecutive_fails >= CONSECUTIVE_FAIL_LIMIT:
+                    print(
+                        f"\n\n❌ {CONSECUTIVE_FAIL_LIMIT}건 연속 실패. "
+                        f"서비스키 또는 API 상태를 확인하세요."
+                    )
+                    break
 
             # 스피너 상태 업데이트
             done_from_start = (d - start_date).days + 1
             spinner.update(d.isoformat(), done_from_start, count, len(failed))
 
-            # 연도 전환 시 중간 저장
+            # 중간 저장 (연도 전환 또는 500건마다)
             next_d = d + timedelta(days=1)
-            if next_d.year != d.year or interrupted:
+            should_save = (
+                next_d.year != d.year
+                or interrupted
+                or api_calls % 500 == 0
+            )
+            if should_save:
                 save_progress(progress_path, d, count)
-                # 중간 JSON 저장
                 json_path.write_text(
                     json.dumps(records, ensure_ascii=False, indent=None),
                     encoding="utf-8",
@@ -467,13 +505,23 @@ def download_range(
         )
         print(f"   ⚠ 실패: {failed_path} ({len(failed)}건)")
 
-    # 완료 시 진행 상태 파일 삭제
-    if not interrupted and not failed:
+    # 완료/중단 상태 메시지
+    all_done = not interrupted and not failed and not quota_reached and consecutive_fails < CONSECUTIVE_FAIL_LIMIT
+    if all_done:
         if progress_path.exists():
             progress_path.unlink()
         print(f"\n🎉 완료! 총 {len(records):,}건 다운로드")
+    elif quota_reached:
+        save_progress(progress_path, d, count)
+        print(
+            f"\n📊 일일 한도 정지. 이번 실행: {api_calls:,}건 호출, {count - existing_count:,}건 수집."
+            f"\n   다시 실행하면 이어서 다운로드합니다."
+        )
     elif interrupted:
         print(f"\n⏸ 중단됨. 다시 실행하면 이어서 다운로드합니다.")
+    elif consecutive_fails >= CONSECUTIVE_FAIL_LIMIT:
+        save_progress(progress_path, d, count)
+        print(f"\n❌ 연속 실패로 중단. 서비스키/API 상태 확인 후 다시 실행하세요.")
     else:
         print(f"\n⚠ 완료 (실패 {len(failed)}건). 실패 목록을 확인하세요.")
 
@@ -489,8 +537,9 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 예시:
-  python download_lunar_solar.py                     # 기본: 1826~2050
+  python download_lunar_solar.py                          # 기본: 1826~2050
   python download_lunar_solar.py --start 2000 --end 2025  # 특정 기간
+  python download_lunar_solar.py --daily-limit 1000       # 일일 1,000건 제한
   python download_lunar_solar.py --no-resume              # 처음부터 다시
         """,
     )
@@ -517,6 +566,12 @@ def main():
         action="store_true",
         help="이전 진행 상태를 무시하고 처음부터 다시 시작",
     )
+    parser.add_argument(
+        "--daily-limit",
+        type=int,
+        default=DEFAULT_DAILY_LIMIT,
+        help="일일 API 호출 한도 (기본: 0=무제한). 한도 도달 시 진행 저장 후 종료",
+    )
 
     args = parser.parse_args()
 
@@ -533,6 +588,7 @@ def main():
         service_key=service_key,
         output_dir=output_dir,
         resume=not args.no_resume,
+        daily_limit=args.daily_limit,
     )
 
 
