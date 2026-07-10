@@ -166,7 +166,7 @@ schedule:
 
 ## 📁 출력 파일
 
-```
+```text
 data/
 ├── lunar_solar_1826_2050.json    # JSON 배열 (전체 데이터)
 ├── lunar_solar_1826_2050.csv     # CSV (Excel 호환 UTF-8 BOM)
@@ -200,7 +200,7 @@ data/
 
 ## 🗂 프로젝트 구조
 
-```
+```text
 .
 ├── download_lunar_solar.py          # 메인 다운로드 스크립트
 ├── .env                             # 서비스키 설정 (git에서 제외)
@@ -229,6 +229,7 @@ data/
 > 만약 429가 빈번하면 단일 모드(`parallel: false`)를 사용하세요.
 
 **Q: 이 데이터로 무엇을 할 수 있나요?**
+
 > - 음력 생일/기념일 → 양력 날짜 변환
 > - 전통 명절(설날, 추석 등) 날짜 조회
 > - 60갑자 일진/세차 기반 분석
@@ -249,10 +250,10 @@ data/
 
 이 프로젝트가 도움이 되셨다면 후원을 통해 개발자를 응원해주세요!
 
-<a href="https://github.com/sponsors/YOUR_GITHUB_USERNAME">
+<a href="https://github.com/sponsors/veryfaraway">
   <img src="https://img.shields.io/badge/Sponsor-GitHub_Sponsors-ea4aaa?style=for-the-badge&logo=github-sponsors&logoColor=white" alt="GitHub Sponsors" />
 </a>
-<a href="https://ko-fi.com/YOUR_KOFI_USERNAME">
+<a href="https://ko-fi.com/eoneone">
   <img src="https://storage.ko-fi.com/cdn/brandasset/kofi_button_blue.png" alt="Buy Me a Coffee at ko-fi.com" height="36" />
 </a>
 
