@@ -29,6 +29,9 @@ from pathlib import Path
 from xml.etree import ElementTree
 
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import random
+from requests.adapters import HTTPAdapter
 
 
 # ─────────────────────────────────────────────
@@ -58,13 +61,17 @@ FIELDS = [
 
 FIELD_KEYS = [f[0] for f in FIELDS]
 
-# API 호출 제한: 30 tps → 안전하게 초당 20건
+# 동시 처리 설정
+CONCURRENT_WORKERS = 5   # 동시 API 요청 수
+BATCH_SIZE = 50           # 배치당 날짜 수
+
+# API 호출 제한: 30 tps → 안전하게 초당 20건 (RateLimiter가 관리)
 CALLS_PER_SECOND = 20
-DELAY = 1.0 / CALLS_PER_SECOND
 
 # 재시도 설정
 MAX_RETRIES = 5
-RETRY_BACKOFF = 2.0  # 지수 백오프 기본 초
+RETRY_BACKOFF = 1.0      # 초기 대기 시간 (초) — 기존 2.0에서 단축
+RETRY_MAX_WAIT = 5.0     # 최대 대기 시간 (초) — 기존 32초에서 대폭 단축
 
 # 연속 실패 시 조기 중단 임계값
 CONSECUTIVE_FAIL_LIMIT = 20
@@ -74,6 +81,33 @@ DEFAULT_DAILY_LIMIT = 0  # 0 = 무제한
 
 # 스피너 문자 (Braille 패턴)
 SPINNER_CHARS = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+
+class RateLimiter:
+    """
+    초당 최대 호출 수를 제한하는 슬롯 기반 레이트 리미터.
+    여러 스레드에서 안전하게 사용할 수 있습니다.
+    """
+
+    def __init__(self, calls_per_second: int):
+        self._interval = 1.0 / calls_per_second
+        self._lock = threading.Lock()
+        self._next_slot = time.monotonic()
+
+    def acquire(self):
+        """다음 사용 가능한 슬롯까지 대기합니다."""
+        with self._lock:
+            now = time.monotonic()
+            if self._next_slot <= now:
+                self._next_slot = now + self._interval
+                wait_until = now
+            else:
+                wait_until = self._next_slot
+                self._next_slot += self._interval
+
+        sleep_time = wait_until - time.monotonic()
+        if sleep_time > 0:
+            time.sleep(sleep_time)
 
 
 class Spinner:
@@ -258,10 +292,12 @@ def parse_item(xml_text: str) -> dict | None:
     return record
 
 
-def fetch_day(session: requests.Session, service_key: str, d: date) -> dict | None:
+def fetch_day(
+    session: requests.Session, service_key: str, d: date, rate_limiter=None
+) -> dict | None:
     """
     특정 양력일의 음양력 데이터를 API에서 가져옵니다.
-    재시도 로직 포함.
+    재시도 로직 포함. rate_limiter가 주어지면 호출 전 속도를 제한합니다.
     """
     params = {
         "solYear": f"{d.year:04d}",
@@ -271,6 +307,8 @@ def fetch_day(session: requests.Session, service_key: str, d: date) -> dict | No
     }
 
     for attempt in range(MAX_RETRIES):
+        if rate_limiter:
+            rate_limiter.acquire()
         try:
             resp = session.get(BASE_URL, params=params, timeout=10)
             if resp.status_code == 200:
@@ -279,20 +317,26 @@ def fetch_day(session: requests.Session, service_key: str, d: date) -> dict | No
                     return record
             # 429 또는 5xx → 재시도
             if resp.status_code in (429, 500, 502, 503, 504):
-                wait = RETRY_BACKOFF * (2 ** attempt)
-                print(f"  ⏳ HTTP {resp.status_code}, {wait:.1f}초 후 재시도...")
+                wait = min(
+                    RETRY_BACKOFF * (1.5 ** attempt) + random.uniform(0, 0.5),
+                    RETRY_MAX_WAIT,
+                )
+                print(f"  ⏳ [{d}] HTTP {resp.status_code}, {wait:.1f}초 후 재시도...")
                 time.sleep(wait)
                 continue
             # 기타 에러
-            print(f"  ⚠ HTTP {resp.status_code} for {d}")
+            print(f"  ⚠ [{d}] HTTP {resp.status_code}")
             return None
 
         except requests.exceptions.RequestException as e:
-            wait = RETRY_BACKOFF * (2 ** attempt)
-            print(f"  ⚠ 연결 오류: {e}, {wait:.1f}초 후 재시도...")
+            wait = min(
+                RETRY_BACKOFF * (1.5 ** attempt) + random.uniform(0, 0.5),
+                RETRY_MAX_WAIT,
+            )
+            print(f"  ⚠ [{d}] 연결 오류: {e}, {wait:.1f}초 후 재시도...")
             time.sleep(wait)
 
-    print(f"  ❌ {MAX_RETRIES}번 재시도 실패: {d}")
+    print(f"  ❌ [{d}] {MAX_RETRIES}번 재시도 실패")
     return None
 
 
@@ -398,13 +442,21 @@ def download_range(
         print(f"   기존 데이터 {len(records)}건 로드 완료\n")
 
     session = requests.Session()
+    adapter = HTTPAdapter(
+        pool_connections=CONCURRENT_WORKERS,
+        pool_maxsize=CONCURRENT_WORKERS * 2,
+    )
+    session.mount("http://", adapter)
     session.headers.update({"Accept": "application/xml"})
+
+    rate_limiter = RateLimiter(CALLS_PER_SECOND)
 
     count = existing_count
     api_calls = 0  # 이번 실행에서의 API 호출 수
     failed = []
     consecutive_fails = 0
     quota_reached = False
+    last_processed_date = actual_start - timedelta(days=1)
 
     # Ctrl+C 시 진행 상태 저장
     interrupted = False
@@ -423,29 +475,70 @@ def download_range(
     spinner.count = count
     spinner.start()
 
+    all_dates = list(date_range(actual_start, end_date))
+
     try:
-        for d in date_range(actual_start, end_date):
-            if interrupted:
-                break
+        with ThreadPoolExecutor(max_workers=CONCURRENT_WORKERS) as executor:
+            for batch_offset in range(0, len(all_dates), BATCH_SIZE):
+                if interrupted:
+                    break
 
-            # 일일 한도 체크
-            if daily_limit > 0 and api_calls >= daily_limit:
-                quota_reached = True
-                print(f"\n\n📊 일일 한도 도달 ({daily_limit:,}건). 진행 상태를 저장하고 종료합니다.")
-                break
+                batch = all_dates[batch_offset:batch_offset + BATCH_SIZE]
 
-            record = fetch_day(session, service_key, d)
-            api_calls += 1
+                # 일일 한도 체크
+                if daily_limit > 0:
+                    remaining_quota = daily_limit - api_calls
+                    if remaining_quota <= 0:
+                        quota_reached = True
+                        print(
+                            f"\n\n📊 일일 한도 도달 ({daily_limit:,}건). "
+                            f"진행 상태를 저장하고 종료합니다."
+                        )
+                        break
+                    batch = batch[:remaining_quota]
 
-            if record:
-                records.append(record)
-                count += 1
-                consecutive_fails = 0  # 성공 시 리셋
-            else:
-                failed.append(d.isoformat())
-                consecutive_fails += 1
+                # 배치 내 동시 요청 제출
+                future_to_date = {
+                    executor.submit(
+                        fetch_day, session, service_key, d, rate_limiter
+                    ): d
+                    for d in batch
+                }
 
-                # 연속 실패 시 조기 중단
+                # 결과 수집
+                batch_results = {}
+                batch_failed = []
+                for future in as_completed(future_to_date):
+                    if interrupted:
+                        for f in future_to_date:
+                            f.cancel()
+                        break
+                    d = future_to_date[future]
+                    try:
+                        record = future.result()
+                        if record:
+                            batch_results[d] = record
+                        else:
+                            batch_failed.append(d)
+                    except Exception:
+                        batch_failed.append(d)
+
+                # 날짜 순서대로 결과 추가
+                for d in sorted(batch_results.keys()):
+                    records.append(batch_results[d])
+                    count += 1
+
+                api_calls += len(batch)
+                failed.extend(
+                    fd.isoformat() for fd in sorted(batch_failed)
+                )
+
+                # 연속 실패 판정: 배치 내 성공 건이 있으면 리셋
+                if batch_results:
+                    consecutive_fails = 0
+                else:
+                    consecutive_fails += len(batch)
+
                 if consecutive_fails >= CONSECUTIVE_FAIL_LIMIT:
                     print(
                         f"\n\n❌ {CONSECUTIVE_FAIL_LIMIT}건 연속 실패. "
@@ -453,25 +546,24 @@ def download_range(
                     )
                     break
 
-            # 스피너 상태 업데이트
-            done_from_start = (d - start_date).days + 1
-            spinner.update(d.isoformat(), done_from_start, count, len(failed))
+                # 스피너 상태 업데이트
+                last_processed_date = batch[-1]
+                done_from_start = (
+                    (last_processed_date - start_date).days + 1
+                )
+                spinner.update(
+                    last_processed_date.isoformat(),
+                    done_from_start,
+                    count,
+                    len(failed),
+                )
 
-            # 중간 저장 (연도 전환 또는 500건마다)
-            next_d = d + timedelta(days=1)
-            should_save = (
-                next_d.year != d.year
-                or interrupted
-                or api_calls % 500 == 0
-            )
-            if should_save:
-                save_progress(progress_path, d, count)
+                # 진행 상태 저장 (매 배치마다)
+                save_progress(progress_path, last_processed_date, count)
                 json_path.write_text(
                     json.dumps(records, ensure_ascii=False, indent=None),
                     encoding="utf-8",
                 )
-
-            time.sleep(DELAY)
 
     finally:
         spinner.stop()
@@ -512,7 +604,7 @@ def download_range(
             progress_path.unlink()
         print(f"\n🎉 완료! 총 {len(records):,}건 다운로드")
     elif quota_reached:
-        save_progress(progress_path, d, count)
+        save_progress(progress_path, last_processed_date, count)
         print(
             f"\n📊 일일 한도 정지. 이번 실행: {api_calls:,}건 호출, {count - existing_count:,}건 수집."
             f"\n   다시 실행하면 이어서 다운로드합니다."
@@ -520,7 +612,7 @@ def download_range(
     elif interrupted:
         print(f"\n⏸ 중단됨. 다시 실행하면 이어서 다운로드합니다.")
     elif consecutive_fails >= CONSECUTIVE_FAIL_LIMIT:
-        save_progress(progress_path, d, count)
+        save_progress(progress_path, last_processed_date, count)
         print(f"\n❌ 연속 실패로 중단. 서비스키/API 상태 확인 후 다시 실행하세요.")
     else:
         print(f"\n⚠ 완료 (실패 {len(failed)}건). 실패 목록을 확인하세요.")

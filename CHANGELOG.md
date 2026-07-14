@@ -13,10 +13,13 @@
 - **텔레그램 알림 연동**: 매일 실행 결과(누적 진행률, 남은 일수), 전체 완료 시 cron 비활성화 안내 자동 발송
 - **GitHub Actions cron 스케줄**: 매일 자동 실행으로 대량 데이터 며칠에 걸쳐 무인 완료 지원
 - **`if: always()` artifact 보호**: 워크플로우 취소/실패 시에도 수집 데이터 artifact 업로드 보장
+- **동시 요청 처리**: `ThreadPoolExecutor` 5 workers로 API 호출 병렬화, 스레드 안전 슬롯 기반 레이트 리미터(20 tps) 적용
 
 ### Changed
 - **워크플로우 입력 변경**: `parallel` (true/false) → `daily_limit` (건수)로 더 직관적인 제어
 - **README 전면 개편**: 지능형 실행 모드, 텔레그램 알림, cron 자동화, Secrets 설정 가이드 추가
+- **재시도 백오프 단축**: 지수 2.0 → 1.5 + jitter, 최대 대기 5초 캡 (기존 최대 32초)
+- **HTTP 연결 풀 튜닝**: `HTTPAdapter` 커넥션 풀링으로 연결 재사용 극대화, `RemoteDisconnected` 빈도 감소
 
 ## [0.2.0] - 2026-07-09
 
