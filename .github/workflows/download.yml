@@ -19,7 +19,7 @@ on:
       start_year:
         description: '시작 연도'
         required: true
-        default: '1826'
+        default: '1800'
         type: string
       end_year:
         description: '종료 연도'
@@ -310,7 +310,7 @@ jobs:
         run: |
           START="${{ needs.plan.outputs.start_year }}"
           END="${{ needs.plan.outputs.end_year }}"
-          PROGRESS_FILE="data/.progress_${START}_${END}.json"
+          PROGRESS_FILE="data/progress_${START}_${END}.json"
           JSON_FILE="data/lunar_solar_${START}_${END}.json"
           FAILED_FILE="data/failed_${START}_${END}.json"
 

@@ -344,7 +344,7 @@ def fetch_day(
 # 진행 상태 저장/복원 (재개 기능)
 # ─────────────────────────────────────────────
 def get_progress_path(start_year: int, end_year: int) -> Path:
-    return Path(__file__).parent / "data" / f".progress_{start_year}_{end_year}.json"
+    return Path(__file__).parent / "data" / f"progress_{start_year}_{end_year}.json"
 
 
 def save_progress(progress_path: Path, last_date: date, count: int):
